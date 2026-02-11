@@ -185,51 +185,6 @@ def make_jsonrpc_result(req_id, result):
 def make_jsonrpc_error(req_id, code, message):
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
-@app.route("/", methods=["GET", "POST", "OPTIONS"])
-def root_probe_mcp():
-    # CORS 已由你先前的 add_cors_headers 处理
-    if request.method == "OPTIONS":
-        return make_response("", 200)
-
-    # 试着解析 JSON（若不是 JSON 则回退到普通 probe）
-    req_json = request.get_json(silent=True)
-    app.logger.info("Root received: method=%s headers=%s json=%s", request.method, dict(request.headers), req_json)
-
-    # 如果是 JSON-RPC 请求（MCP 常用），处理 JSON-RPC
-    if isinstance(req_json, dict) and req_json.get("jsonrpc") == "2.0" and "method" in req_json:
-        method = req_json.get("method")
-        req_id = req_json.get("id", None)
-        params = req_json.get("params", {})
-
-        # 处理 tools/list
-        if method == "tools/list":
-            tools = build_tools_manifest()
-            # MCP 可能期望 result 包装为 { "tools": [...], "cursor": null } 之类：
-            result = {"tools": tools, "cursor": None}
-            resp = make_jsonrpc_result(req_id, result)
-            return jsonify(resp), 200
-
-        # 如果客户端询问 initialize / info 等，可返回简单 OK
-        elif method in ("initialize", "server.initialize", "mcp.initialize"):
-            # 回应一些基础信息
-            result = {"status": "ok", "service": "tarot-mcp", "version": "1.0"}
-            return jsonify(make_jsonrpc_result(req_id, result)), 200
-
-        else:
-            # 未知方法，返回 JSON-RPC 错误
-            return jsonify(make_jsonrpc_error(req_id, -32601, f"Method {method} not found")), 200
-
-    # --- 非 JSON-RPC：回退到之前的普通 probe 元数据（兼容你之前测试） ---
-    # 你之前实现的普通 probe/metadata 则放在这里：
-    tools_meta = {
-        "service": "tarot-mcp",
-        "version": "1.0",
-        "tools": [
-            {"name":"draw_one","method":"POST","path":"/draw_one","description":"Draw one tarot card"},
-            {"name":"draw_three","method":"POST","path":"/draw_three","description":"Draw three tarot cards"}
-        ]
-    }
-    return jsonify(tools_meta), 200
 
 # 简单的 CORS 支持（如你已使用 flask_cors 可跳过此段）
 @app.after_request
@@ -240,42 +195,117 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-KEY, Authorization'
     return response
 
-# 根路径处理（Verdure 在同步工具时可能会 POST 到根或探测特定路径）
+# ---- Verdure / MCP 探测兼容补丁开始 (修正版) ----
 @app.route("/", methods=["GET", "POST", "OPTIONS"])
-def root_probe():
-    # 记录请求内容以便排查（会显示在 Render 日志）
-    try:
-        req_json = request.get_json(silent=True)
-    except Exception:
-        req_json = None
-    current_app.logger.info("Received root probe: method=%s, headers=%s, json=%s",
-                            request.method, dict(request.headers), req_json)
-
-    # 如果是 OPTIONS，直接返回 200
+def handle_mcp_request():
+    # 1. 处理 CORS 预检
     if request.method == "OPTIONS":
         return make_response("", 200)
 
-    # 返回一个兼容的 tools 列表（Verdure 看到 200 + JSON 后应认为服务可用并读取工具）
-    # 这个 JSON 是通用格式，若 Verdure 有特定格式要求可根据 logs 调整
-    tools_meta = {
-        "service": "tarot-mcp",
-        "version": "1.0",
-        "tools": [
-            {
-                "name": "draw_one",
-                "method": "POST",
-                "path": "/draw_one",
-                "description": "Draw one tarot card. POST JSON {session_id:...}"
-            },
-            {
-                "name": "draw_three",
-                "method": "POST",
-                "path": "/draw_three",
-                "description": "Draw three tarot cards (past/present/future). POST JSON {session_id:...}"
+    # 2. 获取 JSON 数据
+    req_json = request.get_json(silent=True)
+    current_app.logger.info(f"MCP Request: {req_json}")
+
+    # 3. 如果不是 JSON-RPC (比如浏览器直接访问)，返回基础信息
+    if not req_json or not isinstance(req_json, dict) or "method" not in req_json:
+        return jsonify({
+            "status": "online",
+            "message": "Tarot MCP Server is running. Please use an MCP client to connect.",
+            "endpoints": ["/draw_one", "/draw_three"]
+        }), 200
+
+    # 4. 处理标准 MCP JSON-RPC 请求
+    method = req_json.get("method")
+    req_id = req_json.get("id")
+    params = req_json.get("params", {})
+
+    # --- A. 握手 (Initialize) ---
+    if method == "initialize":
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "tarot-mcp",
+                    "version": "1.0.0"
+                }
             }
-        ]
-    }
-    return jsonify(tools_meta), 200
+        })
+
+    # --- B. 握手确认 (Initialized) ---
+    elif method == "notifications/initialized":
+        # 客户端确认握手完成，不需要回复内容，但要返回 200
+        return "", 200
+
+    # --- C. 列出工具 (List Tools) ---
+    elif method == "tools/list":
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": build_tools_manifest()
+            }
+        })
+
+    # --- D. 调用工具 (Call Tool) ---
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        tool_args = params.get("arguments", {})
+        session_id = tool_args.get("session_id", "default_session")
+        reset_if = tool_args.get("reset_if_exhausted", True)
+
+        try:
+            result_text = ""
+            # 根据工具名调用内部逻辑
+            if tool_name == "draw_one":
+                cards = draw_cards(session_id, 1, reset_if_exhausted=reset_if)
+                # 将结果转为 AI 易读的文本
+                c = cards[0]
+                result_text = f"抽到的牌是：{c['chinese_name']} ({c['card']})\n正逆位：{'正位' if c['orientation']=='upright' else '逆位'}\n含义：{c['meaning']}"
+            
+            elif tool_name == "draw_three":
+                cards = draw_cards(session_id, 3, reset_if_exhausted=reset_if)
+                roles = ["过去", "现在", "未来"]
+                lines = []
+                for i, c in enumerate(cards):
+                    role = roles[i] if i < 3 else f"位置{i+1}"
+                    lines.append(f"【{role}】：{c['chinese_name']} ({c['card']}) - {'正位' if c['orientation']=='upright' else '逆位'}\n含义：{c['meaning']}")
+                result_text = "\n\n".join(lines)
+            
+            else:
+                return jsonify(make_jsonrpc_error(req_id, -32601, f"Tool {tool_name} not found"))
+
+            # 返回 MCP 标准格式结果
+            return jsonify({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": result_text,
+                            # 也可以把原始 JSON 附上
+                            "metadata": {"raw_cards": cards} 
+                        }
+                    ]
+                }
+            })
+
+        except Exception as e:
+            return jsonify(make_jsonrpc_error(req_id, -32000, str(e)))
+
+    # --- E. 未知方法 ---
+    else:
+        # 对于 Ping 等其他方法，返回空结果以防报错
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {}
+        })
 # ---- Verdure / MCP 探测兼容补丁结束 ----
 
 # 健康检查
