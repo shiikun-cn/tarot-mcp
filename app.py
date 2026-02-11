@@ -13,6 +13,7 @@ from typing import List, Dict, Any
 from flask import Flask, request, jsonify, abort
 # ---- Verdure / MCP 探测兼容补丁开始 ----
 from flask import current_app, make_response
+import json
 
 # 可配置项（环境变量）
 PORT = int(os.getenv("PORT", "8080"))
@@ -145,6 +146,90 @@ def draw_cards(session_id: str, n: int, reset_if_exhausted: bool = True) -> List
             "meaning": meaning
         })
     return out
+
+
+# helper: 构造 MCP 风格工具定义（非常简化，但满足 discovery）
+def build_tools_manifest():
+    # 每个 tool 的 input 字段可用 JSON Schema 精确描述；这里给最小示例
+    return [
+        {
+            "name": "draw_one",
+            "description": "Draw one tarot card. POST JSON {session_id: string}",
+            "input": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "reset_if_exhausted": {"type": "boolean"}
+                },
+                "required": ["session_id"]
+            }
+        },
+        {
+            "name": "draw_three",
+            "description": "Draw three tarot cards (past/present/future). POST JSON {session_id: string}",
+            "input": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "reset_if_exhausted": {"type": "boolean"}
+                },
+                "required": ["session_id"]
+            }
+        }
+    ]
+
+# JSON-RPC 响应构造器
+def make_jsonrpc_result(req_id, result):
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+
+def make_jsonrpc_error(req_id, code, message):
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+@app.route("/", methods=["GET", "POST", "OPTIONS"])
+def root_probe_mcp():
+    # CORS 已由你先前的 add_cors_headers 处理
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
+    # 试着解析 JSON（若不是 JSON 则回退到普通 probe）
+    req_json = request.get_json(silent=True)
+    app.logger.info("Root received: method=%s headers=%s json=%s", request.method, dict(request.headers), req_json)
+
+    # 如果是 JSON-RPC 请求（MCP 常用），处理 JSON-RPC
+    if isinstance(req_json, dict) and req_json.get("jsonrpc") == "2.0" and "method" in req_json:
+        method = req_json.get("method")
+        req_id = req_json.get("id", None)
+        params = req_json.get("params", {})
+
+        # 处理 tools/list
+        if method == "tools/list":
+            tools = build_tools_manifest()
+            # MCP 可能期望 result 包装为 { "tools": [...], "cursor": null } 之类：
+            result = {"tools": tools, "cursor": None}
+            resp = make_jsonrpc_result(req_id, result)
+            return jsonify(resp), 200
+
+        # 如果客户端询问 initialize / info 等，可返回简单 OK
+        elif method in ("initialize", "server.initialize", "mcp.initialize"):
+            # 回应一些基础信息
+            result = {"status": "ok", "service": "tarot-mcp", "version": "1.0"}
+            return jsonify(make_jsonrpc_result(req_id, result)), 200
+
+        else:
+            # 未知方法，返回 JSON-RPC 错误
+            return jsonify(make_jsonrpc_error(req_id, -32601, f"Method {method} not found")), 200
+
+    # --- 非 JSON-RPC：回退到之前的普通 probe 元数据（兼容你之前测试） ---
+    # 你之前实现的普通 probe/metadata 则放在这里：
+    tools_meta = {
+        "service": "tarot-mcp",
+        "version": "1.0",
+        "tools": [
+            {"name":"draw_one","method":"POST","path":"/draw_one","description":"Draw one tarot card"},
+            {"name":"draw_three","method":"POST","path":"/draw_three","description":"Draw three tarot cards"}
+        ]
+    }
+    return jsonify(tools_meta), 200
 
 # 简单的 CORS 支持（如你已使用 flask_cors 可跳过此段）
 @app.after_request
