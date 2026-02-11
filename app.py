@@ -265,7 +265,11 @@ def handle_mcp_request():
                 cards = draw_cards(session_id, 1, reset_if_exhausted=reset_if)
                 # 将结果转为 AI 易读的文本
                 c = cards[0]
-                result_text = f"抽到的牌是：{c['chinese_name']} ({c['card']})\n正逆位：{'正位' if c['orientation']=='upright' else '逆位'}\n含义：{c['meaning']}"
+                result_text = (
+				    f"{c['chinese_name']} / {c['card']} / {c.get('japanese_name','')}\n"
+				    f"位置：{'正位' if c['orientation']=='upright' else '逆位'}\n"
+				    f"含义：{c['meaning']}"
+				)
             
             elif tool_name == "draw_three":
                 cards = draw_cards(session_id, 3, reset_if_exhausted=reset_if)
@@ -273,7 +277,12 @@ def handle_mcp_request():
                 lines = []
                 for i, c in enumerate(cards):
                     role = roles[i] if i < 3 else f"位置{i+1}"
-                    lines.append(f"【{role}】：{c['chinese_name']} ({c['card']}) - {'正位' if c['orientation']=='upright' else '逆位'}\n含义：{c['meaning']}")
+                    lines.append(
+					    f"【{role}】\n"
+					    f"{c['chinese_name']} / {c['card']} / {c.get('japanese_name','')}\n"
+					    f"位置：{'正位' if c['orientation']=='upright' else '逆位'}\n"
+					    f"含义：{c['meaning']}"
+					)
                 result_text = "\n\n".join(lines)
             
             else:
