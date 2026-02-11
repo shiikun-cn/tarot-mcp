@@ -11,6 +11,8 @@ import threading
 import time
 from typing import List, Dict, Any
 from flask import Flask, request, jsonify, abort
+# ---- Verdure / MCP 探测兼容补丁开始 ----
+from flask import current_app, make_response
 
 # 可配置项（环境变量）
 PORT = int(os.getenv("PORT", "8080"))
@@ -143,6 +145,53 @@ def draw_cards(session_id: str, n: int, reset_if_exhausted: bool = True) -> List
             "meaning": meaning
         })
     return out
+
+# 简单的 CORS 支持（如你已使用 flask_cors 可跳过此段）
+@app.after_request
+def add_cors_headers(response):
+    # 允许 Verdure 平台访问（根据需要收紧 origin）
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-KEY, Authorization'
+    return response
+
+# 根路径处理（Verdure 在同步工具时可能会 POST 到根或探测特定路径）
+@app.route("/", methods=["GET", "POST", "OPTIONS"])
+def root_probe():
+    # 记录请求内容以便排查（会显示在 Render 日志）
+    try:
+        req_json = request.get_json(silent=True)
+    except Exception:
+        req_json = None
+    current_app.logger.info("Received root probe: method=%s, headers=%s, json=%s",
+                            request.method, dict(request.headers), req_json)
+
+    # 如果是 OPTIONS，直接返回 200
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
+    # 返回一个兼容的 tools 列表（Verdure 看到 200 + JSON 后应认为服务可用并读取工具）
+    # 这个 JSON 是通用格式，若 Verdure 有特定格式要求可根据 logs 调整
+    tools_meta = {
+        "service": "tarot-mcp",
+        "version": "1.0",
+        "tools": [
+            {
+                "name": "draw_one",
+                "method": "POST",
+                "path": "/draw_one",
+                "description": "Draw one tarot card. POST JSON {session_id:...}"
+            },
+            {
+                "name": "draw_three",
+                "method": "POST",
+                "path": "/draw_three",
+                "description": "Draw three tarot cards (past/present/future). POST JSON {session_id:...}"
+            }
+        ]
+    }
+    return jsonify(tools_meta), 200
+# ---- Verdure / MCP 探测兼容补丁结束 ----
 
 # 健康检查
 @app.route("/health", methods=["GET"])
